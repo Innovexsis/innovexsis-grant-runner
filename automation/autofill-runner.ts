@@ -229,6 +229,7 @@ interface JobClaimResp {
   application: { id: string; status: string } | null;
   applicant_facts: Record<string, string>;
   login: { username: string; password: string } | null;
+  registration_login: { username: string; password: string } | null;
   documents: { doc_type: string; file_name: string; url: string | null }[];
 }
 
@@ -819,8 +820,11 @@ async function processFreelancerGig(job: FreelancerGigClaimResp) {
   } catch (e) {
     console.error(`[gig:${job.id}] error`, e);
     if (e instanceof PortalUnreachableError) {
+      // Requeue, but flag it so the backend can cap dead links instead of
+      // cycling them through the worker pool forever.
       await updateGig(job.id, {
         status: "queued",
+        unreachable: true,
         next_retry_at: new Date(Date.now() + 30 * 60_000).toISOString(),
         error_log: e.message,
       });
@@ -1114,6 +1118,103 @@ async function attemptLogin(page: Page, login: { username: string; password: str
   return true;
 }
 
+async function attemptPasswordlessLogin(
+  page: Page,
+  sessionId: string,
+  facts: Record<string, string>,
+): Promise<boolean> {
+  const identity = facts.founder_email ?? facts.applicant_email
+    ?? facts.founder_mobile ?? facts.applicant_mobile ?? facts.founder_phone;
+  if (!identity) return false;
+
+  const started = await page.evaluate(() => {
+    const candidates = Array.from(document.querySelectorAll("a, button, input[type='button'], input[type='submit']"));
+    const control = candidates.find((node) => /login\s+with\s+otp|sign\s+in\s+with\s+otp|passwordless|send\s+otp|forgot\s+password|create\s+account|register|sign\s*up/i
+      .test((node.textContent ?? (node as HTMLInputElement).value ?? "").trim()));
+    if (!control) return false;
+    (control as HTMLElement).click();
+    return true;
+  });
+  if (!started) return false;
+  await page.waitForTimeout(750);
+
+  const identityFilled = await fillFirstAvailable(
+    page,
+    [/email|mobile|phone|contact.?no|user.?name|login.?id|registration.?no/],
+    identity,
+  );
+  if (!identityFilled) return false;
+  await clickNext(page);
+  await page.waitForTimeout(750);
+
+  const prompt = await detectOtpPrompt(page);
+  if (!prompt) return !(await loginRequired(page));
+  await updateJob(sessionId, { awaiting_otp: true, otp_prompt: prompt, current_step: "awaiting_passwordless_otp" });
+  const otp = await waitForOtp(sessionId, 5 * 60 * 1000);
+  if (!otp) return false;
+  const otpFilled = await fillFirstAvailable(page, [/otp|verification.?code|one.?time|security.?code/], otp);
+  await updateJob(sessionId, { otp_value: null, awaiting_otp: false, current_step: "verifying_passwordless_otp" });
+  if (!otpFilled) return false;
+  await clickNext(page);
+  await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
+  return !(await loginRequired(page));
+}
+
+async function attemptAccountRegistration(page: Page, job: JobClaimResp): Promise<boolean> {
+  const registration = job.registration_login;
+  if (!registration || !job.posting.portal) return false;
+  const opened = await page.evaluate(() => {
+    const candidates = Array.from(document.querySelectorAll("a, button, input[type='button'], input[type='submit']"));
+    const control = candidates.find((node) => /create\s+account|new\s+registration|register|sign\s*up/i
+      .test((node.textContent ?? (node as HTMLInputElement).value ?? "").trim()));
+    if (!control) return false;
+    (control as HTMLElement).click();
+    return true;
+  });
+  if (!opened) return false;
+  await page.waitForTimeout(750);
+
+  const emailFilled = await fillFirstAvailable(page, [/email|user.?name|login.?id/], registration.username);
+  const passwordFilled = await fillFirstAvailable(page, [/^password$|new.?password|create.?password|passwd|pwd/], registration.password);
+  await fillFirstAvailable(page, [/confirm.?password|re.?enter.?password|repeat.?password/], registration.password);
+  if (!emailFilled || !passwordFilled) return false;
+
+  const fields = await extractFormFields(page);
+  for (const field of fields) {
+    if (field.type === "file" || /password|email|user.?name|login.?id/i.test(`${field.name} ${field.id} ${field.label}`)) continue;
+    const value = await resolveJobValue(field, job.applicant_facts);
+    if (!value) continue;
+    await fillField(page, { selector: field.selector, source: "applicant_facts", type: field.type }, value).catch(() => {});
+  }
+  const captchaText = await solveCaptcha(page);
+  if (captchaText) await fillFirstAvailable(page, [/captcha|verification.?text|security.?code/], captchaText);
+  await clickNext(page);
+  await page.waitForTimeout(750);
+
+  const prompt = await detectOtpPrompt(page);
+  if (prompt) {
+    await updateJob(job.session_id, { awaiting_otp: true, otp_prompt: prompt, current_step: "awaiting_registration_otp" });
+    const otp = await waitForOtp(job.session_id, 5 * 60 * 1000);
+    if (!otp) return false;
+    const otpFilled = await fillFirstAvailable(page, [/otp|verification.?code|one.?time|security.?code/], otp);
+    await updateJob(job.session_id, { otp_value: null, awaiting_otp: false, current_step: "verifying_registration_otp" });
+    if (!otpFilled) return false;
+    await clickNext(page);
+    await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
+  }
+
+  // Only treat registration as successful when the portal no longer asks to log in.
+  if (await loginRequired(page)) return false;
+
+  const save = await fetch(`${APP}/api/public/jobs/portal-creds`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-runner-secret": SECRET },
+    body: JSON.stringify({ user_id: job.user_id, portal_key: job.posting.portal }),
+  });
+  if (!save.ok) console.warn(`[job:${job.session_id}] credential-ref save failed`, save.status, await save.text());
+  return true;
+}
+
 async function resolveJobValue(field: { name?: string; id?: string; label?: string; placeholder?: string }, facts: Record<string, string>): Promise<string | null> {
   const hay = `${field.name ?? ""} ${field.id ?? ""} ${field.label ?? ""} ${field.placeholder ?? ""}`.toLowerCase();
   const rules: Array<[RegExp, string[]]> = [
@@ -1167,24 +1268,43 @@ async function processJobApplication(job: JobClaimResp) {
     // Login if required and creds provided.
     if (await loginRequired(page)) {
       if (!job.login) {
-        const shot = await page.screenshot({ fullPage: true });
-        await updateJob(sid, {
-          status: "awaiting_login",
-          screenshot_base64: shot.toString("base64"),
-          next_action: `Portal ${job.posting.portal ?? ""} requires login but no credentials are stored. Save them via secure form.`,
-        });
-        return;
+        await updateJob(sid, { current_step: "attempting_passwordless_login" });
+        let recovered = await attemptPasswordlessLogin(page, sid, job.applicant_facts);
+        if (!recovered) {
+          await gotoResilient(page, applyUrl);
+          await updateJob(sid, { current_step: "attempting_account_registration" });
+          recovered = await attemptAccountRegistration(page, job);
+        }
+        if (recovered) {
+          // Return to the application form; registration/login flows leave
+          // the browser on a dashboard or confirmation page.
+          await gotoResilient(page, applyUrl);
+          if (await loginRequired(page)) recovered = false;
+        }
+        if (recovered) {
+          await updateJob(sid, { current_step: "passwordless_login_complete" });
+        } else {
+          const shot = await page.screenshot({ fullPage: true });
+          await updateJob(sid, {
+            status: "awaiting_login",
+            screenshot_base64: shot.toString("base64"),
+            next_action: `Portal ${job.posting.portal ?? ""} requires a password-based account. Passwordless login, account registration, and email OTP recovery were attempted automatically. Store portal credentials securely to continue.`,
+          });
+          return;
+        }
       }
-      await updateJob(sid, { current_step: "logging_in" });
-      const ok = await attemptLogin(page, job.login);
-      if (!ok) {
-        const shot = await page.screenshot({ fullPage: true });
-        await updateJob(sid, {
-          status: "awaiting_login",
-          screenshot_base64: shot.toString("base64"),
-          next_action: "Runner could not find login fields. Complete the login manually and retry.",
-        });
-        return;
+      if (job.login) {
+        await updateJob(sid, { current_step: "logging_in" });
+        const ok = await attemptLogin(page, job.login);
+        if (!ok) {
+          const shot = await page.screenshot({ fullPage: true });
+          await updateJob(sid, {
+            status: "awaiting_login",
+            screenshot_base64: shot.toString("base64"),
+            next_action: "Runner could not find login fields. Complete the login manually and retry.",
+          });
+          return;
+        }
       }
       // OTP after login?
       if (await detectOtpPrompt(page)) {
@@ -1278,8 +1398,11 @@ async function processJobApplication(job: JobClaimResp) {
   } catch (e) {
     console.error(`[job:${sid}] error`, e);
     if (e instanceof PortalUnreachableError) {
+      // Flagged requeue: the backend caps repeated unreachable attempts so a
+      // permanently dead apply link eventually fails instead of looping.
       await updateJob(sid, {
         status: "queued",
+        current_step: "requeued_portal_unreachable",
         next_retry_at: new Date(Date.now() + 30 * 60_000).toISOString(),
         error_log: e.message,
       });
@@ -1361,7 +1484,9 @@ async function main() {
       const worked = await runOneJob(Math.min(PER_JOB_TIMEOUT_MS, remainingMs - 10_000));
       if (worked) { done++; idleRounds = 0; continue; }
       idleRounds++;
-      if (idleRounds >= 4) break; // queue drained
+      // Long-lived hosts (self-chaining workflow, VM) keep polling for the
+      // whole budget so new work is claimed within seconds, not next cron.
+      if (idleRounds >= Number(process.env.RUNNER_MAX_IDLE_ROUNDS ?? 4)) break; // queue drained
       await new Promise((r) => setTimeout(r, IDLE_SLEEP_MS));
     } catch (e) {
       console.error("worker loop error", e);
