@@ -4,9 +4,14 @@ on:
   push:
     branches: [main] # first tick fires immediately on repo creation — no manual "Run workflow" click
   schedule:
-    # Every 5 minutes (GitHub's minimum). Public repos = unlimited free minutes.
+    # Backstop only. GitHub delays scheduled runs by up to an hour, which used
+    # to leave the queue unclaimed for ~50 min — the self-chain below fixes that.
     - cron: "*/5 * * * *"
-  workflow_dispatch: {} # manual trigger from the Actions tab
+  workflow_dispatch: {} # manual / watchdog / self-chain trigger
+
+permissions:
+  contents: read
+  actions: write # lets the run dispatch its own successor (self-chain)
 
 jobs:
   poll:
@@ -18,7 +23,7 @@ jobs:
       group: autofill-runner-${{ matrix.worker }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 58
     steps:
       - uses: actions/checkout@v4
 
@@ -34,15 +39,35 @@ jobs:
         working-directory: automation
         run: bunx playwright install --with-deps chromium
 
-      - name: Poll for queued sessions (max 8 min, then exit for next cron tick)
+      - name: Poll for queued sessions (~50 min, keeps polling while idle)
         working-directory: automation
         env:
           APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
           RUNNER_SHARED_SECRET: ${{ secrets.RUNNER_SHARED_SECRET }}
           RUNNER_ID: github-${{ github.run_id }}-${{ matrix.worker }}
           RUNNER_HEADLESS: "1"
-          RUNNER_RUN_BUDGET_MS: "440000"
+          RUNNER_RUN_BUDGET_MS: "3000000"
+          RUNNER_MAX_IDLE_ROUNDS: "100000"
         run: |
           # Preserve failures so watchdog diagnostics can distinguish a healthy
           # drain from a crashed browser instead of reporting a false success.
-          timeout --preserve-status 480 bun run autofill-runner.ts
+          timeout --preserve-status 3120 bun run autofill-runner.ts
+
+  # Self-chain: as soon as this run ends (success, failure or timeout), start
+  # the next one. GITHUB_TOKEN may trigger workflow_dispatch, so the runner
+  # keeps going around the clock without depending on GitHub's cron.
+  chain:
+    needs: poll
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Dispatch next run (retry x3)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in 1 2 3; do
+            gh workflow run runner.yml --repo "${{ github.repository }}" --ref main && exit 0
+            sleep $((i * 10))
+          done
+          echo "self-chain dispatch failed; cron/watchdog will restart"
