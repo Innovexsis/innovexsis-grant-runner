@@ -153,6 +153,35 @@ async function gotoResilient(page: Page, url: string, opts: { timeout?: number }
 
 
 
+async function waitForFormFields(page: Page) {
+  await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
+  await page.waitForSelector("input:not([type=hidden]), select, textarea", { timeout: 15_000 }).catch(() => {});
+  let fields = await extractFormFields(page);
+  if (fields.length === 0) {
+    // Embedded form inside an iframe: navigate to the frame itself.
+    const frame = page.frames().find((f) => f !== page.mainFrame() && /form|apply|typeform|clickup|google\.com\/forms|jotform|hubspot/i.test(f.url()));
+    if (frame) {
+      await page.goto(frame.url(), { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
+      await page.waitForSelector("input:not([type=hidden]), select, textarea", { timeout: 15_000 }).catch(() => {});
+      fields = await extractFormFields(page);
+    }
+  }
+  return fields;
+}
+
+/** Click the page's own "Apply now / Register" link. Returns true if we moved. */
+async function followApplyLink(page: Page): Promise<boolean> {
+  const before = page.url();
+  const link = page.locator("a, button").filter({ hasText: /^\s*(apply( now| here| online)?|start (your )?application|register( now)?|submit (an )?application)\s*$/i }).first();
+  if (!(await link.count().catch(() => 0))) return false;
+  const href = await link.getAttribute("href").catch(() => null);
+  try {
+    if (href && /^https?:/i.test(href)) await page.goto(href, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    else await Promise.all([page.waitForLoadState("domcontentloaded", { timeout: 20_000 }).catch(() => {}), link.click({ timeout: 10_000 })]);
+  } catch { return false; }
+  return page.url() !== before;
+}
+
 interface FieldEntry { selector: string; source: string; type: string }
 interface FileEntry { selector: string; doc_type: string }
 
@@ -873,8 +902,16 @@ async function processJob(job: ClaimResp) {
       await update(job.session_id, { current_step: "analysing" });
       await gotoResilient(page, portalUrl);
 
-      const fields = await extractFormFields(page);
-      const submitSel = await findSubmitCandidate(page);
+      // JS-rendered forms (ClickUp, Typeform, Google Forms, React portals)
+      // have no inputs at DOMContentLoaded — wait for them before deciding.
+      let fields = await waitForFormFields(page);
+      let submitSel = await findSubmitCandidate(page);
+      // Information page? Follow its own "Apply" link once before escalating.
+      if (fields.length === 0 && !submitSel && await followApplyLink(page)) {
+        fields = await waitForFormFields(page);
+        submitSel = await findSubmitCandidate(page);
+        portalUrl = page.url();
+      }
       // A catalogue/home page is not an application form. Previously these
       // pages were sent through AI mapping and retried up to 500 times, which
       // consumed every worker slot without any possibility of submission.
