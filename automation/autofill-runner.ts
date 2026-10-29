@@ -15,6 +15,8 @@ import { mkdir, writeFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { runnerLanes } from "./runner-lanes";
+import { requiredAnswerBlockers } from "./submission-safety";
 
 // Self-healing base URL. A workspace move (or a rename) can leave APP_BASE_URL
 // pointing at a host that now answers 3xx instead of serving the API — the
@@ -22,13 +24,15 @@ import { randomUUID } from "node:crypto";
 // at boot and adopt the first one that actually serves the API.
 const BASE_CANDIDATES = [
   process.env.APP_BASE_URL,
-  "https://grantmonsy.innovexsis.com",
-  "https://grant-wizardry-26.lovable.app",
-  "https://project--4c40a0f5-5a99-4ee7-ae1f-360884387fc6.lovable.app",
+  ...(process.env.RUNNER_LANES === "jobs" ? [] : [
+    "https://grantmonsy.innovexsis.com",
+    "https://grant-wizardry-26.lovable.app",
+    "https://project--4c40a0f5-5a99-4ee7-ae1f-360884387fc6.lovable.app",
+  ]),
 ].filter((u): u is string => Boolean(u)).map((u) => u.replace(/\/+$/, ""));
 
 let APP = BASE_CANDIDATES[0] ?? "";
-const SECRET = process.env.RUNNER_SHARED_SECRET!;
+const SECRET = process.env.RUNNER_SHARED_SECRET;
 const RUNNER_ID = process.env.RUNNER_ID ?? `runner-${randomUUID().slice(0, 8)}`;
 const RESUME_TPL = process.env.RESUME_URL_TEMPLATE ?? "";
 // CI/servers have no display. Default to headless and require an explicit
@@ -315,12 +319,9 @@ async function claimAutofill(): Promise<RunnerJob | null> {
 }
 
 async function claim(): Promise<RunnerJob | null> {
-  const claimers: Array<() => Promise<RunnerJob | null>> = [
-    claimAutofill,
-    claimJobApplication,
-    claimFreelancerGig,
-  ];
-  const start = claimCursor;
+  const laneClaims = { grants: claimAutofill, jobs: claimJobApplication, freelancer: claimFreelancerGig };
+  const claimers: Array<() => Promise<RunnerJob | null>> = runnerLanes(process.env.RUNNER_LANES).map(l => laneClaims[l]);
+  const start = claimCursor % claimers.length;
   claimCursor = (claimCursor + 1) % claimers.length;
   for (let offset = 0; offset < claimers.length; offset++) {
     const claimer = claimers[(start + offset) % claimers.length];
@@ -542,23 +543,6 @@ async function extractReference(page: Page): Promise<string | null> {
   }).catch(() => null);
 }
 
-/** Tick every mandatory declaration/consent checkbox before submitting. */
-async function acceptDeclarations(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]')) as HTMLInputElement[];
-    let n = 0;
-    for (const b of boxes) {
-      const hay = `${b.name} ${b.id} ${b.closest("label")?.textContent ?? ""} ${b.parentElement?.textContent?.slice(0, 200) ?? ""}`.toLowerCase();
-      if (b.checked) continue;
-      if (/declar|agree|consent|terms|undertak|certif|true and correct|i hereby/.test(hay)) {
-        b.click();
-        n++;
-      }
-    }
-    return n;
-  }).catch(() => 0);
-}
-
 /** Detect the real final Submit control without activating it. */
 async function hasFinalSubmitControl(page: Page): Promise<boolean> {
   return page.evaluate(() => {
@@ -583,128 +567,8 @@ async function hasFinalSubmitControl(page: Page): Promise<boolean> {
  * the portal would reject.
  */
 async function missingRequiredFields(page: Page): Promise<string[]> {
-  return page.evaluate(() => {
-    const out: string[] = [];
-    const els = Array.from(document.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(
-      "input[required], select[required], textarea[required], input[aria-required='true'], select[aria-required='true'], textarea[aria-required='true']",
-    ));
-    for (const el of els) {
-      const r = el.getBoundingClientRect();
-      if (r.width === 0 && r.height === 0) continue;
-      if (el instanceof HTMLInputElement && (el.type === "checkbox" || el.type === "radio")) {
-        const group = el.name
-          ? Array.from(document.getElementsByName(el.name)) as HTMLInputElement[]
-          : [el];
-        if (!group.some((g) => g.checked)) out.push(el.name || el.id || "checkbox");
-        continue;
-      }
-      if (el instanceof HTMLInputElement && el.type === "file") continue;
-      if (!String(el.value ?? "").trim()) out.push(el.name || el.id || el.getAttribute("aria-label") || "field");
-    }
-    return Array.from(new Set(out)).slice(0, 25);
-  }).catch(() => []);
+  return page.evaluate(requiredAnswerBlockers).catch(() => ["Required answers could not be verified"]);
 }
-
-/** Keyword → value answers built from the stored company + brand profile. */
-export function buildProfileAnswers(
-  entity: Record<string, unknown> | null,
-  brand: Record<string, unknown> | null,
-): Array<[string, string]> {
-  const e = (k: string) => (entity?.[k] == null ? "" : String(entity[k]));
-  const b = (k: string) => (brand?.[k] == null ? "" : String(brand[k]));
-  const name = e("authorized_signatory_name") || "Vivek Srivastava";
-  const [first, ...rest] = name.split(/\s+/);
-  const pitch = b("one_liner") || b("description") || `${b("brand_name") || e("legal_name")} — ${b("sector") || "technology"} startup by Innovexsis Consulting.`;
-  const long = [b("description"), b("tech_stack_summary"), pitch].filter(Boolean).join(" ").slice(0, 1500) || pitch;
-  const pairs: Array<[string, string]> = [
-    ["first\\s*name|given\\s*name|fname", first ?? name],
-    ["last\\s*name|surname|family\\s*name|lname", rest.join(" ") || "Srivastava"],
-    ["founder|full\\s*name|your\\s*name|contact\\s*person|applicant\\s*name|^\\s*name\\s*$|\\bname\\b", name],
-    ["e-?mail", e("authorized_signatory_email") || "director@innovexsis.com"],
-    ["phone|mobile|whatsapp|contact\\s*(no|number)|tel", e("authorized_signatory_phone") || "+919717220498"],
-    ["linkedin", b("linkedin_url") || "https://www.linkedin.com/company/innovexsis"],
-    ["website|url|link|domain", b("domain_url") || "https://innovexsis.com"],
-    ["company|startup|organi[sz]ation|venture|business|entity|brand", b("brand_name") || e("legal_name")],
-    ["city|location|based|headquarter", e("city") || "Noida"],
-    ["state", e("state") || "Uttar Pradesh"],
-    ["country|nationality", "India"],
-    ["pin\\s*code|zip|postal", e("pincode") || "201301"],
-    ["address", e("registered_address")],
-    ["sector|industry|vertical|domain|category", b("sector") || "Technology"],
-    ["stage", b("stage") || "MVP"],
-    ["team\\s*size|employees|headcount|no\\.?\\s*of\\s*(people|members)", "5"],
-    ["founded|incorporat|year|date", e("incorporation_date")],
-    ["revenue|turnover|arr|mrr|raised|funding|amount|invest", "0"],
-    ["one.?liner|tagline|elevator|summary|brief", pitch],
-    ["describe|description|about|problem|solution|why|what|how|tell\\s*us|pitch|idea|traction|vision|product", long],
-  ];
-  return pairs.filter(([, v]) => v);
-}
-
-/**
- * Last-mile self-heal: fill every still-empty visible required control from
- * the stored profile (or a safe first option) so submit is never blocked on
- * a field the deterministic mapper could not name (e.g. ClickUp `cu-form-control-4`).
- */
-async function autoFillRequired(page: Page, answers: Array<[string, string]>): Promise<number> {
-  return page.evaluate((pairs) => {
-    const rx = pairs.map(([s, v]) => [new RegExp(s, "i"), v] as const);
-    const fallbackLong = pairs[pairs.length - 1]?.[1] ?? "";
-    const labelOf = (el: Element) => {
-      const i = el as HTMLInputElement;
-      const bits = [i.name, i.id, i.placeholder, i.getAttribute("aria-label")];
-      if (i.id) bits.push(document.querySelector(`label[for="${CSS.escape(i.id)}"]`)?.textContent ?? "");
-      bits.push(i.closest("label")?.textContent ?? "");
-      const wrap = i.closest("[class*='form'], [class*='field'], [class*='question'], div");
-      bits.push(wrap?.textContent?.slice(0, 200) ?? "");
-      return bits.filter(Boolean).join(" ");
-    };
-    const setVal = (el: HTMLInputElement | HTMLTextAreaElement, v: string) => {
-      const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      Object.getOwnPropertyDescriptor(proto, "value")?.set?.call(el, v);
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      el.dispatchEvent(new Event("blur", { bubbles: true }));
-    };
-    let n = 0;
-    const els = Array.from(document.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(
-      "input[required], select[required], textarea[required], [aria-required='true']",
-    ));
-    for (const el of els) {
-      const r = el.getBoundingClientRect();
-      if (r.width === 0 && r.height === 0) continue;
-      const label = labelOf(el);
-      if (el instanceof HTMLSelectElement) {
-        if (el.value) continue;
-        const opts = Array.from(el.options).filter((o) => o.value && !/select|choose|--/i.test(o.text));
-        const hit = rx.find(([re]) => re.test(label));
-        const pick = (hit && opts.find((o) => o.text.toLowerCase().includes(hit[1].toLowerCase()))) ?? opts[0];
-        if (pick) { el.value = pick.value; el.dispatchEvent(new Event("change", { bubbles: true })); n++; }
-        continue;
-      }
-      if (el instanceof HTMLInputElement && (el.type === "checkbox" || el.type === "radio")) {
-        const group = el.name ? (Array.from(document.getElementsByName(el.name)) as HTMLInputElement[]) : [el];
-        if (!group.some((g) => g.checked)) { group[0].click(); n++; }
-        continue;
-      }
-      if (el instanceof HTMLInputElement && el.type === "file") continue;
-      if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) continue;
-      if (String(el.value ?? "").trim()) continue;
-      const t = (el.type || "").toLowerCase();
-      let v = rx.find(([re]) => re.test(label))?.[1] ?? "";
-      if (t === "email") v = pairs.find(([s]) => s.startsWith("e-?mail"))?.[1] ?? v;
-      else if (t === "tel") v = pairs.find(([s]) => s.startsWith("phone"))?.[1] ?? v;
-      else if (t === "url") v = pairs.find(([s]) => s.startsWith("website"))?.[1] ?? v;
-      else if (t === "number") v = /^\d+(\.\d+)?$/.test(v) ? v : "0";
-      else if (t === "date") v = /^\d{4}-\d{2}-\d{2}/.test(v) ? v.slice(0, 10) : "2024-01-01";
-      if (!v) v = el instanceof HTMLTextAreaElement ? fallbackLong : (pairs[0]?.[1] ?? "N/A");
-      setVal(el, v);
-      n++;
-    }
-    return n;
-  }, answers).catch(() => 0);
-}
-
 
 /** Activate the final Submit control and wait for the portal to settle. */
 async function clickFinalSubmit(page: Page): Promise<boolean> {
@@ -750,7 +614,6 @@ async function driveToSubmission(
   page: Page,
   onOtp: () => Promise<string | null>,
   maxRounds = 14,
-  answers: Array<[string, string]> = [],
 ): Promise<{ ok: true; reference: string | null } | { ok: false; blocker: Blocker; detail: string }> {
   let submitAttempts = 0;
   const MAX_SUBMIT_ATTEMPTS = Number(process.env.MAX_SUBMIT_ATTEMPTS ?? 4);
@@ -789,17 +652,8 @@ async function driveToSubmission(
       return { ok: false, blocker: "login_required", detail: "Portal shows a login wall" };
     }
 
-    await acceptDeclarations(page);
-
     if (await hasFinalSubmitControl(page)) {
-      let missing = await missingRequiredFields(page);
-      if (missing.length > 0 && answers.length > 0) {
-        const healed = await autoFillRequired(page, answers);
-        if (healed > 0) {
-          await page.waitForTimeout(800);
-          missing = await missingRequiredFields(page);
-        }
-      }
+      const missing = await missingRequiredFields(page);
       if (missing.length > 0) {
         return {
           ok: false,
@@ -1099,7 +953,7 @@ async function processJob(job: ClaimResp) {
       const otp = await waitForOtp(job.session_id, OTP_WAIT_MS);
       await update(job.session_id, { otp_value: null, awaiting_otp: false, current_step: "verifying_otp" });
       return otp;
-    }, 14, buildProfileAnswers(job.entity, job.brand));
+    }, 14);
 
     const shot = await page.screenshot({ fullPage: true });
     if (outcome.ok) {
