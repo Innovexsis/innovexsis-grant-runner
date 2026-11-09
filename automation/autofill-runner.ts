@@ -25,6 +25,7 @@ import { requiredAnswerBlockers } from "./submission-safety";
 const BASE_CANDIDATES = [
   process.env.APP_BASE_URL,
   ...(process.env.RUNNER_LANES === "jobs" ? [] : [
+    "https://grantmoney.innovexsis.com",
     "https://startupgrants.innovexsis.com",
     "https://grantmonsy.innovexsis.com",
     "https://grant-wizardry-26.lovable.app",
