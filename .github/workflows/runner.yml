@@ -1,73 +1,91 @@
 name: Autofill Runner
 
+# Cost-bounded design (Nov 2026). The previous self-chain multiplied: every
+# cron/watchdog start added another never-ending chain, reaching 40,000+ runs
+# and hundreds of parallel jobs. Now:
+#   - one workflow-level concurrency group => at most 1 running + 1 pending
+#     run, extra dispatches collapse instead of piling up;
+#   - a 10-second pre-check skips browser start-up when nothing is claimable;
+#   - workers exit after ~2 idle minutes; the next run only starts if the
+#     queue still has claimable work.
 on:
-  push:
-    branches: [main] # first tick fires immediately on repo creation — no manual "Run workflow" click
   schedule:
-    # Backstop only. GitHub delays scheduled runs by up to an hour, which used
-    # to leave the queue unclaimed for ~50 min — the self-chain below fixes that.
-    - cron: "*/5 * * * *"
-  workflow_dispatch: {} # manual / watchdog / self-chain trigger
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
 
 permissions:
   contents: read
-  actions: write # lets the run dispatch its own successor (self-chain)
+  actions: write
+
+concurrency:
+  group: autofill-runner
+  cancel-in-progress: false
 
 jobs:
-  poll:
-    strategy:
-      fail-fast: false
-      matrix:
-        worker: [1, 2, 3, 4, 5, 6, 7, 8]
-    concurrency:
-      group: autofill-runner-${{ matrix.worker }}
-      cancel-in-progress: false
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 58
+    timeout-minutes: 2
+    outputs:
+      pending: ${{ steps.q.outputs.pending }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Install runner deps
-        working-directory: automation
-        run: bun install --frozen-lockfile || bun install
-
-      - name: Install Playwright browsers
-        working-directory: automation
-        run: bunx playwright install --with-deps chromium
-
-      - name: Poll for queued sessions (~50 min, keeps polling while idle)
-        working-directory: automation
+      - id: q
         env:
           APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
           RUNNER_SHARED_SECRET: ${{ secrets.RUNNER_SHARED_SECRET }}
+        run: |
+          p=0
+          for base in https://startupgrants.innovexsis.com "$APP_BASE_URL"; do
+            [ -z "$base" ] && continue
+            body=$(curl -s --max-time 20 -H "x-runner-secret: $RUNNER_SHARED_SECRET" "$base/api/public/runner/pending" || true)
+            n=$(echo "$body" | python3 -c "import json,sys; print(int(json.load(sys.stdin).get('pending',0)))" 2>/dev/null || echo "")
+            if [ -n "$n" ]; then p=$n; break; fi
+          done
+          echo "claimable sessions: $p"
+          echo "pending=$p" >> "$GITHUB_OUTPUT"
+
+  poll:
+    needs: check
+    if: needs.check.outputs.pending != '0'
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [1, 2]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install runner deps
+        working-directory: automation
+        run: bun install --frozen-lockfile || bun install
+      - name: Install Playwright browsers
+        working-directory: automation
+        run: bunx playwright install --with-deps chromium
+      - name: Process claimable sessions (exits when idle)
+        working-directory: automation
+        env:
+          APP_BASE_URL: https://startupgrants.innovexsis.com
+          RUNNER_SHARED_SECRET: ${{ secrets.RUNNER_SHARED_SECRET }}
           RUNNER_ID: github-${{ github.run_id }}-${{ matrix.worker }}
           RUNNER_HEADLESS: "1"
-          RUNNER_RUN_BUDGET_MS: "3000000"
-          RUNNER_MAX_IDLE_ROUNDS: "100000"
-        run: |
-          # Preserve failures so watchdog diagnostics can distinguish a healthy
-          # drain from a crashed browser instead of reporting a false success.
-          timeout --preserve-status 3120 bun run autofill-runner.ts
+          RUNNER_RUN_BUDGET_MS: "2400000"
+          RUNNER_MAX_IDLE_ROUNDS: "8"
+        run: timeout --preserve-status 2580 bun run autofill-runner.ts
 
-  # Self-chain: as soon as this run ends (success, failure or timeout), start
-  # the next one. GITHUB_TOKEN may trigger workflow_dispatch, so the runner
-  # keeps going around the clock without depending on GitHub's cron.
-  chain:
+  next:
     needs: poll
-    if: always()
+    if: always() && needs.poll.result != 'skipped'
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 2
     steps:
-      - name: Dispatch next run (retry x3)
+      - name: Continue only while claimable work remains
         env:
           GH_TOKEN: ${{ github.token }}
+          RUNNER_SHARED_SECRET: ${{ secrets.RUNNER_SHARED_SECRET }}
         run: |
-          for i in 1 2 3; do
-            gh workflow run runner.yml --repo "${{ github.repository }}" --ref main && exit 0
-            sleep $((i * 10))
-          done
-          echo "self-chain dispatch failed; cron/watchdog will restart"
+          body=$(curl -s --max-time 20 -H "x-runner-secret: $RUNNER_SHARED_SECRET" https://startupgrants.innovexsis.com/api/public/runner/pending || true)
+          n=$(echo "$body" | python3 -c "import json,sys; print(int(json.load(sys.stdin).get('pending',0)))" 2>/dev/null || echo 0)
+          echo "claimable after run: $n"
+          if [ "$n" -gt 0 ]; then gh workflow run runner.yml --repo "${{ github.repository }}" --ref main || true; fi
